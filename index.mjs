@@ -52,7 +52,19 @@ function getHumanReadableDateTime(date = new Date()) {
 
 function createEmptyOutput() {
     return {
-        channelId: null,
+        updatedAt: null,
+        updatedAtHumanReadable: null,
+        totalSavedUrls: 0,
+        newlySavedUrls: 0,
+        channels: {},
+    };
+}
+
+function createEmptyChannelOutput(channelId = null, channelInput = null, channelTitle = null) {
+    return {
+        channelId,
+        channelTitle,
+        channelInputs: channelInput ? [channelInput] : [],
         updatedAt: null,
         updatedAtHumanReadable: null,
         totalSavedUrls: 0,
@@ -61,10 +73,15 @@ function createEmptyOutput() {
     };
 }
 
-function collectSavedUrls(savedData) {
-    return Object.values(savedData.urlSets ?? {})
+function collectSavedUrls(channelData) {
+    return Object.values(channelData.urlSets ?? {})
         .flat()
         .filter((url) => typeof url === 'string');
+}
+
+function collectAllSavedUrls(savedData) {
+    return Object.values(savedData.channels ?? {})
+        .flatMap((channelData) => collectSavedUrls(channelData));
 }
 
 function createUniqueUrlSetKey(urlSets, baseKey) {
@@ -83,11 +100,19 @@ function createUniqueUrlSetKey(urlSets, baseKey) {
     return key;
 }
 
+function addUniqueValue(values, value) {
+    if (!value) {
+        return values ?? [];
+    }
+
+    return Array.from(new Set([...(values ?? []), value]));
+}
+
 async function getUploadsPlaylistId(channelInput) {
     const lookup = parseChannelInput(channelInput);
 
     const response = await youtube.channels.list({
-        part: ['contentDetails'],
+        part: ['contentDetails', 'snippet'],
         ...lookup,
     });
 
@@ -99,12 +124,13 @@ async function getUploadsPlaylistId(channelInput) {
 
     return {
         channelId: channel.id,
+        channelTitle: channel.snippet?.title ?? null,
         uploadsPlaylistId: channel.contentDetails.relatedPlaylists.uploads,
     };
 }
 
 async function getAllUploadedVideoUrls(channelInput) {
-    const {channelId, uploadsPlaylistId} = await getUploadsPlaylistId(channelInput);
+    const {channelId, channelTitle, uploadsPlaylistId} = await getUploadsPlaylistId(channelInput);
 
     const urls = [];
     let pageToken = undefined;
@@ -130,8 +156,109 @@ async function getAllUploadedVideoUrls(channelInput) {
 
     return {
         channelId,
+        channelTitle,
         urls,
     };
+}
+
+function normalizeExistingData(parsed) {
+    // New multi-channel format:
+    // {
+    //   "channels": {
+    //     "UC...": {
+    //       "urlSets": {
+    //         "25/05/2026, 21:15:30": [...]
+    //       }
+    //     }
+    //   }
+    // }
+    if (parsed.channels && typeof parsed.channels === 'object' && !Array.isArray(parsed.channels)) {
+        const output = {
+            ...createEmptyOutput(),
+            ...parsed,
+            channels: parsed.channels,
+        };
+
+        output.totalSavedUrls = collectAllSavedUrls(output).length;
+
+        return output;
+    }
+
+    // Backward compatibility for oldest format:
+    // [
+    //   "https://www.youtube.com/watch?v=..."
+    // ]
+    if (Array.isArray(parsed)) {
+        const legacyChannelId = 'legacy-channel';
+
+        const output = createEmptyOutput();
+
+        output.channels[legacyChannelId] = {
+            ...createEmptyChannelOutput(legacyChannelId),
+            channelTitle: 'Legacy imported channel',
+            urlSets: {
+                'legacy import': parsed,
+            },
+            totalSavedUrls: parsed.length,
+        };
+
+        output.totalSavedUrls = parsed.length;
+
+        return output;
+    }
+
+    // Backward compatibility for previous single-channel urlSets format:
+    // {
+    //   "channelId": "UC...",
+    //   "urlSets": {
+    //     "25/05/2026, 21:15:30": [...]
+    //   }
+    // }
+    if (parsed.urlSets && typeof parsed.urlSets === 'object' && !Array.isArray(parsed.urlSets)) {
+        const channelId = parsed.channelId ?? 'legacy-channel';
+
+        const channelData = {
+            ...createEmptyChannelOutput(channelId),
+            ...parsed,
+            channelId,
+            urlSets: parsed.urlSets,
+        };
+
+        channelData.totalSavedUrls = collectSavedUrls(channelData).length;
+
+        const output = createEmptyOutput();
+
+        output.channels[channelId] = channelData;
+        output.totalSavedUrls = collectAllSavedUrls(output).length;
+
+        return output;
+    }
+
+    // Backward compatibility for previous format:
+    // {
+    //   "urls": [...]
+    // }
+    if (Array.isArray(parsed.urls)) {
+        const channelId = parsed.channelId ?? 'legacy-channel';
+
+        const output = createEmptyOutput();
+
+        output.channels[channelId] = {
+            ...createEmptyChannelOutput(channelId),
+            ...parsed,
+            channelId,
+            urlSets: {
+                'legacy import': parsed.urls,
+            },
+            totalSavedUrls: parsed.urls.length,
+        };
+
+        output.totalSavedUrls = parsed.urls.length;
+
+        return output;
+    }
+
+    throw new Error('Invalid JSON format');
 }
 
 async function readExistingData(filePath) {
@@ -144,48 +271,7 @@ async function readExistingData(filePath) {
 
         const parsed = JSON.parse(fileContent);
 
-        // Backward compatibility for the oldest format:
-        // [
-        //   "https://www.youtube.com/watch?v=..."
-        // ]
-        if (Array.isArray(parsed)) {
-            return {
-                ...createEmptyOutput(),
-                urlSets: {
-                    'legacy import': parsed,
-                },
-            };
-        }
-
-        // Current preferred format:
-        // {
-        //   "urlSets": {
-        //     "25/05/2026, 21:15:30": [...]
-        //   }
-        // }
-        if (parsed.urlSets && typeof parsed.urlSets === 'object' && !Array.isArray(parsed.urlSets)) {
-            return {
-                ...createEmptyOutput(),
-                ...parsed,
-                urlSets: parsed.urlSets,
-            };
-        }
-
-        // Backward compatibility for your previous format:
-        // {
-        //   "urls": [...]
-        // }
-        if (Array.isArray(parsed.urls)) {
-            return {
-                ...createEmptyOutput(),
-                ...parsed,
-                urlSets: {
-                    'legacy import': parsed.urls,
-                },
-            };
-        }
-
-        throw new Error(`Invalid JSON format in ${filePath}`);
+        return normalizeExistingData(parsed);
     } catch (error) {
         if (error.code === 'ENOENT') {
             return createEmptyOutput();
@@ -195,80 +281,133 @@ async function readExistingData(filePath) {
     }
 }
 
-async function saveOnlyNewUrls(channelInput, outputFile = DEFAULT_OUTPUT_FILE) {
-    const {channelId, urls: fetchedUrls} = await getAllUploadedVideoUrls(channelInput);
-
+async function saveOnlyNewUrls(channelInputs, outputFile = DEFAULT_OUTPUT_FILE) {
     const existingData = await readExistingData(outputFile);
-    const existingUrls = collectSavedUrls(existingData);
-    const existingUrlSet = new Set(existingUrls);
-
-    const newUrls = fetchedUrls.filter((url) => !existingUrlSet.has(url));
 
     const now = new Date();
     const humanReadableDateTime = getHumanReadableDateTime(now);
 
-    const urlSets = {
-        ...(existingData.urlSets ?? {}),
-    };
-
-    let newUrlSetKey = null;
-
-    if (newUrls.length > 0) {
-        newUrlSetKey = createUniqueUrlSetKey(urlSets, humanReadableDateTime);
-        urlSets[newUrlSetKey] = newUrls;
-    }
-
-    const totalSavedUrls = collectSavedUrls({urlSets}).length;
+    const results = [];
+    let totalFetchedUrls = 0;
+    let totalNewlySavedUrls = 0;
 
     const output = {
-        channelId,
-        updatedAt: now.toISOString(),
-        updatedAtHumanReadable: humanReadableDateTime,
-        totalSavedUrls,
-        newlySavedUrls: newUrls.length,
-        urlSets,
+        ...existingData,
+        channels: {
+            ...(existingData.channels ?? {}),
+        },
     };
+
+    for (const channelInput of channelInputs) {
+        const {
+            channelId,
+            channelTitle,
+            urls: fetchedUrls,
+        } = await getAllUploadedVideoUrls(channelInput);
+
+        totalFetchedUrls += fetchedUrls.length;
+
+        const existingChannelData =
+            output.channels[channelId] ??
+            createEmptyChannelOutput(channelId, channelInput, channelTitle);
+
+        const existingUrls = collectSavedUrls(existingChannelData);
+        const existingUrlSet = new Set(existingUrls);
+
+        const newUrls = fetchedUrls.filter((url) => !existingUrlSet.has(url));
+
+        const urlSets = {
+            ...(existingChannelData.urlSets ?? {}),
+        };
+
+        let newUrlSetKey = null;
+
+        if (newUrls.length > 0) {
+            newUrlSetKey = createUniqueUrlSetKey(urlSets, humanReadableDateTime);
+            urlSets[newUrlSetKey] = newUrls;
+        }
+
+        const totalSavedUrlsForChannel = collectSavedUrls({urlSets}).length;
+
+        output.channels[channelId] = {
+            ...existingChannelData,
+            channelId,
+            channelTitle: channelTitle ?? existingChannelData.channelTitle ?? null,
+            channelInputs: addUniqueValue(existingChannelData.channelInputs, channelInput),
+            updatedAt: now.toISOString(),
+            updatedAtHumanReadable: humanReadableDateTime,
+            totalSavedUrls: totalSavedUrlsForChannel,
+            newlySavedUrls: newUrls.length,
+            urlSets,
+        };
+
+        totalNewlySavedUrls += newUrls.length;
+
+        results.push({
+            channelInput,
+            channelId,
+            channelTitle,
+            totalFetchedUrls: fetchedUrls.length,
+            totalSavedUrls: totalSavedUrlsForChannel,
+            newlySavedUrls: newUrls.length,
+            newUrlSetKey,
+            newUrls,
+        });
+    }
+
+    output.updatedAt = now.toISOString();
+    output.updatedAtHumanReadable = humanReadableDateTime;
+    output.totalSavedUrls = collectAllSavedUrls(output).length;
+    output.newlySavedUrls = totalNewlySavedUrls;
 
     await fs.writeFile(outputFile, `${JSON.stringify(output, null, 2)}\n`, 'utf8');
 
     return {
         outputFile,
-        totalFetchedUrls: fetchedUrls.length,
-        totalSavedUrls,
-        newlySavedUrls: newUrls.length,
-        newUrlSetKey,
-        newUrls,
+        totalFetchedUrls,
+        totalSavedUrls: output.totalSavedUrls,
+        newlySavedUrls: totalNewlySavedUrls,
+        channels: results,
     };
 }
 
 // CLI usage:
-// node youtube-videos.js @GoogleDevelopers
-// node youtube-videos.js @GoogleDevelopers my-output-file.json
+// node youtube-videos.js @GoogleDevelopers @freecodecamp @Fireship
+// node youtube-videos.js https://www.youtube.com/@GoogleDevelopers https://www.youtube.com/@freecodecamp
 
-const channelInput = process.argv[2];
-const outputFile = process.argv[3] ?? DEFAULT_OUTPUT_FILE;
+const channelInputs = process.argv.slice(2);
 
-if (!channelInput) {
-    console.error('Usage: node youtube-videos.js <channel-id-or-url-or-handle> [output-file]');
+if (channelInputs.length === 0) {
+    console.error('Usage: node youtube-videos.js <channel-id-or-url-or-handle> [...more-channels]');
     process.exit(1);
 }
 
-saveOnlyNewUrls(channelInput, outputFile)
+saveOnlyNewUrls(channelInputs)
     .then((result) => {
         console.log(`Fetched URLs: ${result.totalFetchedUrls}`);
-        console.log(`Already saved + new URLs: ${result.totalSavedUrls}`);
-        console.log(`Newly saved URLs: ${result.newlySavedUrls}`);
+        console.log(`Already saved + new URLs across all channels: ${result.totalSavedUrls}`);
+        console.log(`Newly saved URLs across all channels: ${result.newlySavedUrls}`);
         console.log(`Output file: ${result.outputFile}`);
 
-        if (result.newUrls.length > 0) {
-            console.log(`\nNew URL set: ${result.newUrlSetKey}`);
-            console.log('New URLs:');
+        for (const channelResult of result.channels) {
+            console.log('\n----------------------------------------');
+            console.log(`Channel input: ${channelResult.channelInput}`);
+            console.log(`Channel title: ${channelResult.channelTitle ?? 'Unknown'}`);
+            console.log(`Channel ID: ${channelResult.channelId}`);
+            console.log(`Fetched URLs: ${channelResult.totalFetchedUrls}`);
+            console.log(`Already saved + new URLs for this channel: ${channelResult.totalSavedUrls}`);
+            console.log(`Newly saved URLs for this channel: ${channelResult.newlySavedUrls}`);
 
-            for (const url of result.newUrls) {
-                console.log(url);
+            if (channelResult.newUrls.length > 0) {
+                console.log(`New URL set: ${channelResult.newUrlSetKey}`);
+                console.log('New URLs:');
+
+                for (const url of channelResult.newUrls) {
+                    console.log(url);
+                }
+            } else {
+                console.log('No new URLs found for this channel.');
             }
-        } else {
-            console.log('\nNo new URLs found.');
         }
     })
     .catch((error) => {
